@@ -72,7 +72,7 @@ export interface ProviderHealth {
   note?: string;
 }
 
-export type ProviderId = "gemini" | "grok" | "elevenlabs";
+export type ProviderId = "gemini" | "grok" | "ollama" | "elevenlabs";
 
 export interface Settings {
   /* cognition */
@@ -81,6 +81,8 @@ export interface Settings {
   grokApiKey: string;
   grokModel: string;
   grokEnabled: boolean;
+  ollamaBaseUrl: string;
+  ollamaModel: string;
   complexityThreshold: number;
   requestTimeoutMs: number;
   /* voice */
@@ -192,7 +194,7 @@ export interface SubsystemStatus {
 }
 
 export interface RoutingDecision {
-  path: "local-tool" | "gemini" | "gemini+grok" | "grok-fallback" | "offline";
+  path: "local-tool" | "gemini" | "gemini+grok" | "grok-fallback" | "local-ollama" | "offline";
   score: number;
   reasons: string[];
 }

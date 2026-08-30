@@ -504,7 +504,7 @@ function ConfigTab({ api }: { api: UltronApi }) {
 
   const set = (patch: Partial<Settings>) => setDraft((d) => ({ ...d, ...patch }));
 
-  const runTest = async (which: "gemini" | "grok" | "elevenlabs") => {
+  const runTest = async (which: "gemini" | "grok" | "ollama" | "elevenlabs") => {
     setTesting(which);
     setTestOut((o) => ({ ...o, [which]: "" }));
     const out = await api.testProvider(which);
@@ -554,6 +554,28 @@ function ConfigTab({ api }: { api: UltronApi }) {
           <Field label="REQUEST TIMEOUT (MS)">
             <input type="number" min={5000} max={60000} step={1000} value={draft.requestTimeoutMs} onChange={(e) => set({ requestTimeoutMs: Number(e.target.value) || 20000 })} className={inputCls} />
           </Field>
+        </div>
+      </div>
+
+      <div>
+        <div className="panel-title mb-2 text-lime/80">Local Brain · Ollama</div>
+        <div className="space-y-2.5">
+          <div className="rounded border border-lime/25 bg-lime/5 px-2.5 py-2 font-mono text-[9px] leading-relaxed text-lime/80">
+            KEY-FREE COGNITION. Run <span className="text-lime">ollama serve</span> locally and ULTRON thinks with it
+            automatically — used as primary when no cloud keys exist, and as the last fallback otherwise.
+          </div>
+          <Field label="OLLAMA_BASE_URL" hint="local instance">
+            <input value={draft.ollamaBaseUrl} onChange={(e) => set({ ollamaBaseUrl: e.target.value })} placeholder="http://localhost:11434" className={inputCls} />
+          </Field>
+          <Field label="OLLAMA_MODEL">
+            <input value={draft.ollamaModel} onChange={(e) => set({ ollamaModel: e.target.value })} placeholder="llama3.2" className={inputCls} />
+          </Field>
+          <div className="flex items-center gap-2">
+            <button onClick={() => runTest("ollama")} disabled={testing !== null} className="display rounded border border-lime/50 bg-lime/5 px-2.5 py-1.5 text-[8px] tracking-[0.18em] text-lime transition-all hover:bg-lime/15 disabled:opacity-40">
+              {testing === "ollama" ? "TESTING…" : "TEST LINK"}
+            </button>
+            <span className="font-mono text-[8.5px] leading-snug text-dim">{testOut.ollama}</span>
+          </div>
         </div>
       </div>
 

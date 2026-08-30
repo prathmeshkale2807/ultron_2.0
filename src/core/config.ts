@@ -16,6 +16,8 @@ export const DEFAULT_SETTINGS: Settings = {
   grokApiKey: "",
   grokModel: "grok-3-mini",
   grokEnabled: true,
+  ollamaBaseUrl: "",
+  ollamaModel: "llama3.2",
   complexityThreshold: 6,
   requestTimeoutMs: 20000,
   voiceEnabled: false,

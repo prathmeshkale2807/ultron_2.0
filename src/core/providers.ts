@@ -37,6 +37,16 @@ function describeError(e: unknown): string {
   return "unknown provider error";
 }
 
+/* A provider with no credentials is not a failure — it is a
+   standby state. Callers treat it distinctly from real outages. */
+export class NotConfiguredError extends Error {
+  readonly kind = "not-configured";
+  constructor(provider: string, envVar: string) {
+    super(`${provider} is on standby — ${envVar} not configured.`);
+    this.name = "NotConfiguredError";
+  }
+}
+
 /* ------------------------- GEMINI ------------------------- */
 
 export async function generateGemini(
@@ -44,7 +54,7 @@ export async function generateGemini(
   opts: GenerateOptions
 ): Promise<string> {
   const key = s.geminiApiKey.trim();
-  if (!key) throw new Error("Gemini is not configured (GEMINI_API_KEY missing).");
+  if (!key) throw new NotConfiguredError("Gemini", "GEMINI_API_KEY");
   const model = s.geminiModel.trim() || "gemini-2.0-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
@@ -118,7 +128,7 @@ export async function generateGrok(
   opts: GenerateOptions
 ): Promise<string> {
   const key = s.grokApiKey.trim();
-  if (!key) throw new Error("Grok is not configured (GROK_API_KEY missing).");
+  if (!key) throw new NotConfiguredError("Grok", "GROK_API_KEY");
   const model = s.grokModel.trim() || "grok-3-mini";
 
   const messages = [
@@ -192,7 +202,7 @@ export async function synthesizeElevenLabs(
 ): Promise<Blob> {
   const key = s.elevenApiKey.trim();
   const voiceId = resolveVoiceId(s, want);
-  if (!key) throw new Error("ElevenLabs is not configured.");
+  if (!key) throw new NotConfiguredError("ElevenLabs", "ELEVENLABS_API_KEY");
   if (!voiceId)
     throw new Error("No ElevenLabs voice id configured — falling back to local speech.");
 
@@ -237,12 +247,74 @@ export async function pingElevenLabs(s: Settings): Promise<number> {
   return Math.round(performance.now() - t0);
 }
 
+/* --------------------- OLLAMA (LOCAL) --------------------- */
+/* Zero-key cognition path. A locally running Ollama instance
+   becomes ULTRON's brain when no cloud keys are configured —
+   exactly the fallback the original architecture specified. */
+
+export function ollamaBase(s: Settings): string {
+  return s.ollamaBaseUrl.trim().replace(/\/+$/, "");
+}
+
+export async function generateOllama(
+  s: Settings,
+  opts: GenerateOptions
+): Promise<string> {
+  const base = ollamaBase(s);
+  if (!base) throw new NotConfiguredError("Ollama", "OLLAMA_BASE_URL");
+  const res = await withTimeout(
+    fetch(`${base}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: s.ollamaModel.trim() || "llama3.2",
+        stream: false,
+        messages: [
+          ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+          ...opts.messages.map((m) => ({ role: m.role, content: m.content })),
+        ],
+        options: {
+          temperature: opts.temperature ?? 0.7,
+          num_predict: opts.maxTokens ?? 800,
+        },
+      }),
+    }),
+    opts.timeoutMs ?? s.requestTimeoutMs,
+    "Ollama"
+  );
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { error?: string };
+      if (j.error) msg = `${res.status}: ${j.error}`;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`Ollama request failed — ${msg}. Is the model pulled (ollama pull ${s.ollamaModel || "llama3.2"})?`);
+  }
+  const data = (await res.json()) as { message?: { content?: string } };
+  const text = data.message?.content?.trim() ?? "";
+  if (!text) throw new Error("Ollama returned an empty response.");
+  return text;
+}
+
+export async function pingOllama(s: Settings): Promise<{ ms: number; models: number }> {
+  const base = ollamaBase(s);
+  if (!base) throw new NotConfiguredError("Ollama", "OLLAMA_BASE_URL");
+  const t0 = performance.now();
+  const res = await withTimeout(fetch(`${base}/api/tags`), 4000, "Ollama health");
+  if (!res.ok) throw new Error(`Ollama health failed — HTTP ${res.status}`);
+  const data = (await res.json()) as { models?: unknown[] };
+  return { ms: Math.round(performance.now() - t0), models: data.models?.length ?? 0 };
+}
+
 /* -------------------- PROVIDER MANAGER -------------------- */
 
 export class ProviderManager {
   health: Record<ProviderId, ProviderHealth> = {
     gemini: { status: "unconfigured" },
     grok: { status: "unconfigured" },
+    ollama: { status: "unconfigured" },
     elevenlabs: { status: "unconfigured" },
   };
 
@@ -291,6 +363,20 @@ export class ProviderManager {
           })
       );
 
+    if (!ollamaBase(s)) this.set("ollama", { status: "unconfigured" });
+    else
+      jobs.push(
+        pingOllama(s)
+          .then((r) => {
+            this.set("ollama", { status: "online", latencyMs: r.ms, lastCheck: Date.now(), note: `${r.models} model${r.models === 1 ? "" : "s"} available` });
+            emitEvent("PROVIDER_HEALTH", "providers", `Ollama local brain online — ${r.ms} ms · ${r.models} model${r.models === 1 ? "" : "s"}`, "info", r.ms);
+          })
+          .catch((e) => {
+            this.set("ollama", { status: "offline", note: describeError(e), lastCheck: Date.now() });
+            emitEvent("PROVIDER_HEALTH", "providers", `Ollama unreachable at ${ollamaBase(s)} — start it with “ollama serve”`, "warn");
+          })
+      );
+
     if (!s.elevenApiKey.trim()) this.set("elevenlabs", { status: "unconfigured" });
     else
       jobs.push(
@@ -321,6 +407,16 @@ export class ProviderManager {
       s.grokApiKey.trim().length > 0 &&
       this.health.grok.status !== "offline"
     );
+  }
+
+  ollamaReady(s: Settings): boolean {
+    const st = this.health.ollama.status;
+    return ollamaBase(s).length > 0 && st !== "offline" && st !== "unconfigured";
+  }
+
+  /* True when at least one cognition path can serve a request. */
+  cognitionAvailable(s: Settings): boolean {
+    return this.geminiReady(s) || this.grokReady(s) || this.ollamaReady(s);
   }
 
   elevenReady(s: Settings): boolean {

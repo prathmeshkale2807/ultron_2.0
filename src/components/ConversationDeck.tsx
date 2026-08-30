@@ -156,6 +156,7 @@ export function ConversationDeck({
   mic,
   voiceSupported,
   onToggleVoice,
+  cognitionReady,
   settings,
   onOpenConfig,
 }: {
@@ -171,7 +172,8 @@ export function ConversationDeck({
   mic: MicStatus;
   voiceSupported: boolean;
   onToggleVoice: () => void;
-  settings: { geminiApiKey: string; grokApiKey: string; wakeWord: string };
+  cognitionReady: boolean;
+  settings: { wakeWord: string };
   onOpenConfig: () => void;
 }) {
   const [draft, setDraft] = useState("");
@@ -192,7 +194,6 @@ export function ConversationDeck({
 
   const hour = new Date().getHours();
   const daypart = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening";
-  const cognitionReady = Boolean(settings.geminiApiKey || settings.grokApiKey);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -211,16 +212,21 @@ export function ConversationDeck({
             </p>
 
             {!cognitionReady && (
-              <div className="mt-4 flex items-center justify-between gap-3 rounded border border-amber/30 bg-amber/5 px-3.5 py-2.5">
-                <div className="text-[11.5px] text-amber/90">
-                  Primary cognition offline — set <span className="font-mono text-[10px]">GEMINI_API_KEY</span> to unlock full conversation.
+              <div className="mt-4 rounded border border-amber/30 bg-amber/5 px-3.5 py-2.5">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-[11.5px] text-amber/90">
+                    Cloud cognition is on standby. Two ways to bring it online —
+                  </div>
+                  <button
+                    onClick={onOpenConfig}
+                    className="display flex-none rounded border border-amber/50 px-2.5 py-1.5 text-[8.5px] tracking-[0.2em] text-amber transition-all hover:bg-amber/10 active:translate-y-px"
+                  >
+                    CONFIGURE
+                  </button>
                 </div>
-                <button
-                  onClick={onOpenConfig}
-                  className="display flex-none rounded border border-amber/50 px-2.5 py-1.5 text-[8.5px] tracking-[0.2em] text-amber transition-all hover:bg-amber/10 active:translate-y-px"
-                >
-                  CONFIGURE
-                </button>
+                <div className="mt-1.5 font-mono text-[9.5px] leading-relaxed text-amber/70">
+                  1 · set <span className="text-amber">GEMINI_API_KEY</span> &nbsp;2 · or run <span className="text-amber">ollama serve</span> locally — key-free cognition, no cloud at all
+                </div>
               </div>
             )}
 
