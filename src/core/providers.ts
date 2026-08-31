@@ -50,6 +50,22 @@ export class NotConfiguredError extends Error {
 /* Raised when the Gemini server retires the configured checkpoint.
    The orchestrator migrates to the server-recommended model and
    retries once — a model retirement must never read as a crash. */
+/* Server-side throttling (HTTP 429). Carries the server's own
+   retry window so callers can hold instead of burning attempts. */
+export class RateLimitedError extends Error {
+  readonly kind = "rate-limited";
+  constructor(
+    readonly retryAfterMs: number | undefined,
+    readonly isFreeTier: boolean,
+    message: string
+  ) {
+    super(message);
+    this.name = "RateLimitedError";
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export class ModelRetiredError extends Error {
   readonly kind = "model-retired";
   constructor(
@@ -107,6 +123,21 @@ async function callGeminiModel(
     } catch {
       /* body was not json */
     }
+    /* Quota / rate limiting: parse the server's retry window. */
+    if (res.status === 429) {
+      const retryMatch = msg.match(/retry in ([\d.]+)\s*s/i);
+      const retryAfterMs = retryMatch
+        ? Math.min(Math.ceil(parseFloat(retryMatch[1]) * 1000), 20000)
+        : undefined;
+      const isFreeTier = /free_tier|free tier/i.test(msg);
+      throw new RateLimitedError(
+        retryAfterMs,
+        isFreeTier,
+        `Gemini throttled (429)${isFreeTier ? " — free-tier quota" : ""}${
+          retryAfterMs ? ` — retry in ${(retryAfterMs / 1000).toFixed(0)} s` : ""
+        }`
+      );
+    }
     /* Server-side model retirement: parse the directive, fail typed. */
     if (res.status === 404 && /no longer available|deprecat/i.test(msg)) {
       const candidates = Array.from(msg.matchAll(/models\/([A-Za-z0-9._-]+)/g)).map((m) => m[1]);
@@ -139,23 +170,41 @@ export async function generateGemini(
   const key = s.geminiApiKey.trim();
   if (!key) throw new NotConfiguredError("Gemini", "GEMINI_API_KEY");
   const model = migrateGeminiModel(s.geminiModel.trim() || RECOMMENDED_GEMINI_MODEL);
-  try {
-    return await callGeminiModel(key, model, s, opts);
-  } catch (e) {
-    if (e instanceof ModelRetiredError) {
-      const target = e.recommended ?? RECOMMENDED_GEMINI_MODEL;
-      logger.info("gemini", `Server retired ${e.requested} — self-migrating cognition to ${target}`);
-      emitEvent(
-        "PROVIDER_HEALTH",
-        "providers",
-        `Gemini model migrated ${e.requested} → ${target} (server directive)`,
-        "warn"
-      );
-      onModelMigrate?.(target);
-      return callGeminiModel(key, target, s, opts);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await callGeminiModel(key, model, s, opts);
+    } catch (e) {
+      if (e instanceof ModelRetiredError) {
+        const target = e.recommended ?? RECOMMENDED_GEMINI_MODEL;
+        logger.info("gemini", `Server retired ${e.requested} — self-migrating cognition to ${target}`);
+        emitEvent(
+          "PROVIDER_HEALTH",
+          "providers",
+          `Gemini model migrated ${e.requested} → ${target} (server directive)`,
+          "warn"
+        );
+        onModelMigrate?.(target);
+        return callGeminiModel(key, target, s, opts);
+      }
+      /* Quota: hold for the server's own window, retry once in place.
+         The assistant never burns attempts against a live throttle. */
+      if (e instanceof RateLimitedError && attempt === 0 && e.retryAfterMs) {
+        const wait = Math.min(e.retryAfterMs + 800, 21000);
+        logger.info("gemini", `Quota throttled — holding ${(wait / 1000).toFixed(1)} s, then retrying in place`);
+        emitEvent(
+          "PROVIDER_HEALTH",
+          "providers",
+          `Gemini quota — holding ${(wait / 1000).toFixed(0)} s, retrying automatically`,
+          "warn"
+        );
+        await sleep(wait);
+        continue;
+      }
+      throw e;
     }
-    throw e;
   }
+  throw new Error("Gemini unavailable after retry.");
 }
 
 export async function pingGemini(s: Settings): Promise<number> {

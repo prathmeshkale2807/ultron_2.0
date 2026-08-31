@@ -10,7 +10,7 @@
 
 import { emitEvent, logger } from "./eventBus";
 import { MemoryManager } from "./memory";
-import { generateGemini, generateGrok, generateOllama, ProviderManager, toSpeechText } from "./providers";
+import { generateGemini, generateGrok, generateOllama, ProviderManager, RateLimitedError, toSpeechText } from "./providers";
 import { AuditLogger, ConfirmationBroker, SafetyGate } from "./safety";
 import { TaskManager } from "./tasks";
 import { ToolRegistry } from "./tools";
@@ -78,6 +78,7 @@ export class Orchestrator {
   private history: { role: "user" | "assistant"; content: string }[] = [];
   private lastContext: { app?: string; query?: string; tool?: string } = {};
   private pendingTool: { name: string; args: Record<string, unknown> } | null = null;
+  private lastFail: { kind: "rate-limit"; retryMs?: number } | null = null;
 
   constructor(deps: OrchestratorDeps) {
     this.deps = deps;
@@ -420,6 +421,7 @@ export class Orchestrator {
   /* ======================= cognition path ======================= */
 
   private async cognitionTurn(text: string, s: Settings, t0: number): Promise<AssistantTurn> {
+    this.lastFail = null;
     const routing = this.route(text, s);
     emitEvent(
       "ROUTING",
@@ -484,6 +486,14 @@ export class Orchestrator {
           throw new Error("Gemini health is offline.");
         }
       } catch (e) {
+        /* A live throttle is not an outage — stop burning attempts and
+           report the quota window honestly. */
+        if (e instanceof RateLimitedError) {
+          this.lastFail = { kind: "rate-limit", retryMs: e.retryAfterMs };
+          logger.warn("orchestrator", `Gemini throttled — ${e.message}`);
+          emitEvent("PROVIDER_HEALTH", "providers", "Gemini throttled (429) — quota window active", "warn");
+          break;
+        }
         logger.warn("orchestrator", `Gemini attempt ${attempt + 1} failed — ${e instanceof Error ? e.message : "error"}`);
       }
     }
@@ -508,6 +518,11 @@ export class Orchestrator {
       } catch (e) {
         logger.error("orchestrator", `Local Ollama brain also failed — ${e instanceof Error ? e.message : "error"}`);
       }
+    }
+
+    /* Quota throttle without a fallback brain: report the window honestly. */
+    if (reply === null && this.lastFail?.kind === "rate-limit") {
+      return this.quotaTurn(this.lastFail.retryMs, t0);
     }
 
     if (reply === null) {
@@ -554,6 +569,26 @@ export class Orchestrator {
       this.deps.memory.save("USER_PREFERENCE", "name", m[1], "inference");
       emitEvent("MEMORY_WRITE", "memory", `Inferred preference — name: ${m[1]}`);
     }
+  }
+
+  private quotaTurn(retryMs: number | undefined, t0: number): AssistantTurn {
+    const secs = retryMs ? Math.max(1, Math.round(retryMs / 1000)) : 30;
+    const content = [
+      "### Quota ceiling reached — temporary, not an outage",
+      `The Gemini free-tier quota is momentarily exhausted. The server's own window asks for roughly **${secs} s** before the next request clears.`,
+      "",
+      "- **Ask again shortly** — the limit resets continuously, and I will already hold for the window when I can.",
+      "- Set a **GROK_API_KEY** and the reasoning engine carries cognition in the meantime.",
+      "- Or point **OLLAMA_BASE_URL** at a running local instance — key-free and quota-free.",
+      "",
+      "> Tools, memory, tasks and the voice interface remain fully operational while the window clears.",
+    ].join("\n");
+    const speech = `I've reached a quota ceiling on the cognition link, sir — it clears in about ${secs} seconds. Tools and memory remain fully operational.`;
+    return {
+      content,
+      speech,
+      meta: { routing: "gemini-quota", error: true, latencyMs: Math.round(performance.now() - t0) },
+    };
   }
 
   /* ======================= offline brain ======================= */
