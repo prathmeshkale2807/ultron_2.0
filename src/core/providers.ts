@@ -9,7 +9,7 @@
    ============================================================ */
 
 import { emitEvent, logger } from "./eventBus";
-import { redact } from "./config";
+import { migrateGeminiModel, RECOMMENDED_GEMINI_MODEL, redact } from "./config";
 import type { ProviderHealth, ProviderId, Settings } from "./types";
 
 export interface GenerateOptions {
@@ -37,15 +37,56 @@ function describeError(e: unknown): string {
   return "unknown provider error";
 }
 
+/* A provider with no credentials is not a failure — it is a
+   standby state. Callers treat it distinctly from real outages. */
+export class NotConfiguredError extends Error {
+  readonly kind = "not-configured";
+  constructor(provider: string, envVar: string) {
+    super(`${provider} is on standby — ${envVar} not configured.`);
+    this.name = "NotConfiguredError";
+  }
+}
+
+/* Raised when the Gemini server retires the configured checkpoint.
+   The orchestrator migrates to the server-recommended model and
+   retries once — a model retirement must never read as a crash. */
+/* Server-side throttling (HTTP 429). Carries the server's own
+   retry window so callers can hold instead of burning attempts. */
+export class RateLimitedError extends Error {
+  readonly kind = "rate-limited";
+  constructor(
+    readonly retryAfterMs: number | undefined,
+    readonly isFreeTier: boolean,
+    message: string
+  ) {
+    super(message);
+    this.name = "RateLimitedError";
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export class ModelRetiredError extends Error {
+  readonly kind = "model-retired";
+  constructor(
+    readonly requested: string,
+    readonly recommended?: string
+  ) {
+    super(
+      `Model ${requested} has been retired${recommended ? ` — server recommends ${recommended}` : ""}.`
+    );
+    this.name = "ModelRetiredError";
+  }
+}
+
 /* ------------------------- GEMINI ------------------------- */
 
-export async function generateGemini(
+async function callGeminiModel(
+  key: string,
+  model: string,
   s: Settings,
   opts: GenerateOptions
 ): Promise<string> {
-  const key = s.geminiApiKey.trim();
-  if (!key) throw new Error("Gemini is not configured (GEMINI_API_KEY missing).");
-  const model = s.geminiModel.trim() || "gemini-2.0-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent?key=${encodeURIComponent(key)}`;
@@ -82,6 +123,27 @@ export async function generateGemini(
     } catch {
       /* body was not json */
     }
+    /* Quota / rate limiting: parse the server's retry window. */
+    if (res.status === 429) {
+      const retryMatch = msg.match(/retry in ([\d.]+)\s*s/i);
+      const retryAfterMs = retryMatch
+        ? Math.min(Math.ceil(parseFloat(retryMatch[1]) * 1000), 20000)
+        : undefined;
+      const isFreeTier = /free_tier|free tier/i.test(msg);
+      throw new RateLimitedError(
+        retryAfterMs,
+        isFreeTier,
+        `Gemini throttled (429)${isFreeTier ? " — free-tier quota" : ""}${
+          retryAfterMs ? ` — retry in ${(retryAfterMs / 1000).toFixed(0)} s` : ""
+        }`
+      );
+    }
+    /* Server-side model retirement: parse the directive, fail typed. */
+    if (res.status === 404 && /no longer available|deprecat/i.test(msg)) {
+      const candidates = Array.from(msg.matchAll(/models\/([A-Za-z0-9._-]+)/g)).map((m) => m[1]);
+      const recommended = candidates.find((c) => c !== model) ?? RECOMMENDED_GEMINI_MODEL;
+      throw new ModelRetiredError(model, recommended);
+    }
     throw new Error(`Gemini request failed — ${msg}`);
   }
 
@@ -98,6 +160,51 @@ export async function generateGemini(
     );
   }
   return text;
+}
+
+export async function generateGemini(
+  s: Settings,
+  opts: GenerateOptions,
+  onModelMigrate?: (model: string) => void
+): Promise<string> {
+  const key = s.geminiApiKey.trim();
+  if (!key) throw new NotConfiguredError("Gemini", "GEMINI_API_KEY");
+  const model = migrateGeminiModel(s.geminiModel.trim() || RECOMMENDED_GEMINI_MODEL);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await callGeminiModel(key, model, s, opts);
+    } catch (e) {
+      if (e instanceof ModelRetiredError) {
+        const target = e.recommended ?? RECOMMENDED_GEMINI_MODEL;
+        logger.info("gemini", `Server retired ${e.requested} — self-migrating cognition to ${target}`);
+        emitEvent(
+          "PROVIDER_HEALTH",
+          "providers",
+          `Gemini model migrated ${e.requested} → ${target} (server directive)`,
+          "warn"
+        );
+        onModelMigrate?.(target);
+        return callGeminiModel(key, target, s, opts);
+      }
+      /* Quota: hold for the server's own window, retry once in place.
+         The assistant never burns attempts against a live throttle. */
+      if (e instanceof RateLimitedError && attempt === 0 && e.retryAfterMs) {
+        const wait = Math.min(e.retryAfterMs + 800, 21000);
+        logger.info("gemini", `Quota throttled — holding ${(wait / 1000).toFixed(1)} s, then retrying in place`);
+        emitEvent(
+          "PROVIDER_HEALTH",
+          "providers",
+          `Gemini quota — holding ${(wait / 1000).toFixed(0)} s, retrying automatically`,
+          "warn"
+        );
+        await sleep(wait);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("Gemini unavailable after retry.");
 }
 
 export async function pingGemini(s: Settings): Promise<number> {
@@ -118,7 +225,7 @@ export async function generateGrok(
   opts: GenerateOptions
 ): Promise<string> {
   const key = s.grokApiKey.trim();
-  if (!key) throw new Error("Grok is not configured (GROK_API_KEY missing).");
+  if (!key) throw new NotConfiguredError("Grok", "GROK_API_KEY");
   const model = s.grokModel.trim() || "grok-3-mini";
 
   const messages = [
@@ -192,7 +299,7 @@ export async function synthesizeElevenLabs(
 ): Promise<Blob> {
   const key = s.elevenApiKey.trim();
   const voiceId = resolveVoiceId(s, want);
-  if (!key) throw new Error("ElevenLabs is not configured.");
+  if (!key) throw new NotConfiguredError("ElevenLabs", "ELEVENLABS_API_KEY");
   if (!voiceId)
     throw new Error("No ElevenLabs voice id configured — falling back to local speech.");
 
@@ -237,12 +344,74 @@ export async function pingElevenLabs(s: Settings): Promise<number> {
   return Math.round(performance.now() - t0);
 }
 
+/* --------------------- OLLAMA (LOCAL) --------------------- */
+/* Zero-key cognition path. A locally running Ollama instance
+   becomes ULTRON's brain when no cloud keys are configured —
+   exactly the fallback the original architecture specified. */
+
+export function ollamaBase(s: Settings): string {
+  return s.ollamaBaseUrl.trim().replace(/\/+$/, "");
+}
+
+export async function generateOllama(
+  s: Settings,
+  opts: GenerateOptions
+): Promise<string> {
+  const base = ollamaBase(s);
+  if (!base) throw new NotConfiguredError("Ollama", "OLLAMA_BASE_URL");
+  const res = await withTimeout(
+    fetch(`${base}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: s.ollamaModel.trim() || "llama3.2",
+        stream: false,
+        messages: [
+          ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+          ...opts.messages.map((m) => ({ role: m.role, content: m.content })),
+        ],
+        options: {
+          temperature: opts.temperature ?? 0.7,
+          num_predict: opts.maxTokens ?? 800,
+        },
+      }),
+    }),
+    opts.timeoutMs ?? s.requestTimeoutMs,
+    "Ollama"
+  );
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { error?: string };
+      if (j.error) msg = `${res.status}: ${j.error}`;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`Ollama request failed — ${msg}. Is the model pulled (ollama pull ${s.ollamaModel || "llama3.2"})?`);
+  }
+  const data = (await res.json()) as { message?: { content?: string } };
+  const text = data.message?.content?.trim() ?? "";
+  if (!text) throw new Error("Ollama returned an empty response.");
+  return text;
+}
+
+export async function pingOllama(s: Settings): Promise<{ ms: number; models: number }> {
+  const base = ollamaBase(s);
+  if (!base) throw new NotConfiguredError("Ollama", "OLLAMA_BASE_URL");
+  const t0 = performance.now();
+  const res = await withTimeout(fetch(`${base}/api/tags`), 4000, "Ollama health");
+  if (!res.ok) throw new Error(`Ollama health failed — HTTP ${res.status}`);
+  const data = (await res.json()) as { models?: unknown[] };
+  return { ms: Math.round(performance.now() - t0), models: data.models?.length ?? 0 };
+}
+
 /* -------------------- PROVIDER MANAGER -------------------- */
 
 export class ProviderManager {
   health: Record<ProviderId, ProviderHealth> = {
     gemini: { status: "unconfigured" },
     grok: { status: "unconfigured" },
+    ollama: { status: "unconfigured" },
     elevenlabs: { status: "unconfigured" },
   };
 
@@ -291,6 +460,20 @@ export class ProviderManager {
           })
       );
 
+    if (!ollamaBase(s)) this.set("ollama", { status: "unconfigured" });
+    else
+      jobs.push(
+        pingOllama(s)
+          .then((r) => {
+            this.set("ollama", { status: "online", latencyMs: r.ms, lastCheck: Date.now(), note: `${r.models} model${r.models === 1 ? "" : "s"} available` });
+            emitEvent("PROVIDER_HEALTH", "providers", `Ollama local brain online — ${r.ms} ms · ${r.models} model${r.models === 1 ? "" : "s"}`, "info", r.ms);
+          })
+          .catch((e) => {
+            this.set("ollama", { status: "offline", note: describeError(e), lastCheck: Date.now() });
+            emitEvent("PROVIDER_HEALTH", "providers", `Ollama unreachable at ${ollamaBase(s)} — start it with “ollama serve”`, "warn");
+          })
+      );
+
     if (!s.elevenApiKey.trim()) this.set("elevenlabs", { status: "unconfigured" });
     else
       jobs.push(
@@ -321,6 +504,16 @@ export class ProviderManager {
       s.grokApiKey.trim().length > 0 &&
       this.health.grok.status !== "offline"
     );
+  }
+
+  ollamaReady(s: Settings): boolean {
+    const st = this.health.ollama.status;
+    return ollamaBase(s).length > 0 && st !== "offline" && st !== "unconfigured";
+  }
+
+  /* True when at least one cognition path can serve a request. */
+  cognitionAvailable(s: Settings): boolean {
+    return this.geminiReady(s) || this.grokReady(s) || this.ollamaReady(s);
   }
 
   elevenReady(s: Settings): boolean {

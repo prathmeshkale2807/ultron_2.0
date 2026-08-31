@@ -10,11 +10,10 @@
 
 import { emitEvent, logger } from "./eventBus";
 import { MemoryManager } from "./memory";
-import { generateGemini, generateGrok, ProviderManager, toSpeechText } from "./providers";
+import { generateGemini, generateGrok, generateOllama, ProviderManager, RateLimitedError, toSpeechText } from "./providers";
 import { AuditLogger, ConfirmationBroker, SafetyGate } from "./safety";
 import { TaskManager } from "./tasks";
 import { ToolRegistry } from "./tools";
-import { hasCognition } from "./config";
 import type { AssistantTurn, MessageMeta, RoutingDecision, Settings } from "./types";
 
 export interface OrchestratorDeps {
@@ -27,6 +26,9 @@ export interface OrchestratorDeps {
   registry: ToolRegistry;
   providers: ProviderManager;
   sessionId: () => string;
+  /* Lets provider self-healing (e.g. retired-model migration)
+     persist its fix into the central configuration. */
+  onSettingsPatch?: (patch: Partial<Settings>) => void;
 }
 
 const PERSONA = `You are ULTRON, a sophisticated personal AI operating system serving one user.
@@ -76,6 +78,7 @@ export class Orchestrator {
   private history: { role: "user" | "assistant"; content: string }[] = [];
   private lastContext: { app?: string; query?: string; tool?: string } = {};
   private pendingTool: { name: string; args: Record<string, unknown> } | null = null;
+  private lastFail: { kind: "rate-limit"; retryMs?: number } | null = null;
 
   constructor(deps: OrchestratorDeps) {
     this.deps = deps;
@@ -134,7 +137,7 @@ export class Orchestrator {
     }
 
     /* --- cognition path --- */
-    if (!hasCognition(s)) {
+    if (!this.deps.providers.cognitionAvailable(s)) {
       return this.offlineTurn(text, t0);
     }
     return this.cognitionTurn(text, s, t0);
@@ -404,8 +407,12 @@ export class Orchestrator {
 
   private route(text: string, s: Settings): RoutingDecision {
     const { score, reasons } = this.assessComplexity(text);
-    const grokReady = this.deps.providers.grokReady(s);
-    if (grokReady && score >= s.complexityThreshold) {
+    const p = this.deps.providers;
+    /* No cloud cognition at all — the local Ollama brain takes over. */
+    if (!p.geminiReady(s) && !p.grokReady(s) && p.ollamaReady(s)) {
+      return { path: "local-ollama", score, reasons: [...reasons, "cloud cognition offline — local brain engaged"] };
+    }
+    if (p.grokReady(s) && score >= s.complexityThreshold) {
       return { path: "gemini+grok", score, reasons };
     }
     return { path: "gemini", score, reasons };
@@ -414,6 +421,7 @@ export class Orchestrator {
   /* ======================= cognition path ======================= */
 
   private async cognitionTurn(text: string, s: Settings, t0: number): Promise<AssistantTurn> {
+    this.lastFail = null;
     const routing = this.route(text, s);
     emitEvent(
       "ROUTING",
@@ -428,6 +436,19 @@ export class Orchestrator {
       routing: routing.path,
       latencyMs: 0,
     };
+
+    /* --- local Ollama brain: key-free cognition path --- */
+    if (routing.path === "local-ollama") {
+      try {
+        const reply = await generateOllama(s, { system, messages, timeoutMs: s.requestTimeoutMs });
+        this.pushHistory(text, reply);
+        meta.latencyMs = Math.round(performance.now() - t0);
+        return { content: reply, speech: toSpeechText(reply), meta };
+      } catch (e) {
+        logger.warn("orchestrator", `Local Ollama brain failed — ${e instanceof Error ? e.message : "error"}`);
+        return this.offlineTurn(text, t0);
+      }
+    }
 
     /* --- secondary reasoning (only when it earns its cost) --- */
     if (routing.path === "gemini+grok") {
@@ -456,11 +477,23 @@ export class Orchestrator {
     for (let attempt = 0; attempt < 2 && reply === null; attempt++) {
       try {
         if (this.deps.providers.geminiReady(s)) {
-          reply = await generateGemini(s, { system, messages, timeoutMs: s.requestTimeoutMs });
+          reply = await generateGemini(
+            s,
+            { system, messages, timeoutMs: s.requestTimeoutMs },
+            (model) => this.deps.onSettingsPatch?.({ geminiModel: model })
+          );
         } else {
           throw new Error("Gemini health is offline.");
         }
       } catch (e) {
+        /* A live throttle is not an outage — stop burning attempts and
+           report the quota window honestly. */
+        if (e instanceof RateLimitedError) {
+          this.lastFail = { kind: "rate-limit", retryMs: e.retryAfterMs };
+          logger.warn("orchestrator", `Gemini throttled — ${e.message}`);
+          emitEvent("PROVIDER_HEALTH", "providers", "Gemini throttled (429) — quota window active", "warn");
+          break;
+        }
         logger.warn("orchestrator", `Gemini attempt ${attempt + 1} failed — ${e instanceof Error ? e.message : "error"}`);
       }
     }
@@ -476,10 +509,26 @@ export class Orchestrator {
       }
     }
 
+    /* --- final fallback: local Ollama brain answers directly --- */
+    if (reply === null && this.deps.providers.ollamaReady(s)) {
+      try {
+        emitEvent("ROUTING", "orchestrator", "Cloud providers unavailable — local Ollama brain engaged", "warn");
+        reply = await generateOllama(s, { system, messages, timeoutMs: s.requestTimeoutMs });
+        meta.routing = "local-ollama";
+      } catch (e) {
+        logger.error("orchestrator", `Local Ollama brain also failed — ${e instanceof Error ? e.message : "error"}`);
+      }
+    }
+
+    /* Quota throttle without a fallback brain: report the window honestly. */
+    if (reply === null && this.lastFail?.kind === "rate-limit") {
+      return this.quotaTurn(this.lastFail.retryMs, t0);
+    }
+
     if (reply === null) {
       const offline = this.offlineText(text);
       return {
-        content: `${offline}\n\n> Diagnostics: both cognition providers are unreachable right now. The failure is logged, and every tool, memory and voice subsystem remains fully operational.`,
+        content: `${offline}\n\n> Diagnostics: every cognition path — Gemini, Grok and the local Ollama brain — is unreachable right now. The failure is logged, and every tool, memory and voice subsystem remains fully operational.`,
         speech: "I'm afraid my cognition link is down at the moment, sir. Tools and memory remain fully operational — I'll retry shortly.",
         meta: { routing: "offline", error: true, latencyMs: Math.round(performance.now() - t0) },
       };
@@ -522,6 +571,26 @@ export class Orchestrator {
     }
   }
 
+  private quotaTurn(retryMs: number | undefined, t0: number): AssistantTurn {
+    const secs = retryMs ? Math.max(1, Math.round(retryMs / 1000)) : 30;
+    const content = [
+      "### Quota ceiling reached — temporary, not an outage",
+      `The Gemini free-tier quota is momentarily exhausted. The server's own window asks for roughly **${secs} s** before the next request clears.`,
+      "",
+      "- **Ask again shortly** — the limit resets continuously, and I will already hold for the window when I can.",
+      "- Set a **GROK_API_KEY** and the reasoning engine carries cognition in the meantime.",
+      "- Or point **OLLAMA_BASE_URL** at a running local instance — key-free and quota-free.",
+      "",
+      "> Tools, memory, tasks and the voice interface remain fully operational while the window clears.",
+    ].join("\n");
+    const speech = `I've reached a quota ceiling on the cognition link, sir — it clears in about ${secs} seconds. Tools and memory remain fully operational.`;
+    return {
+      content,
+      speech,
+      meta: { routing: "gemini-quota", error: true, latencyMs: Math.round(performance.now() - t0) },
+    };
+  }
+
   /* ======================= offline brain ======================= */
 
   private offlineTurn(text: string, t0: number): AssistantTurn {
@@ -539,7 +608,7 @@ export class Orchestrator {
     const daypart = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening";
 
     if (/\b(who are you|what are you|introduce yourself)\b/.test(t))
-      return "I am ULTRON — a personal AI operating system. Gemini is my primary cognition, Grok stands by for deeper reasoning, and a full tool, memory and safety layer executes on your behalf. At present my cognition link is unconfigured, so I'm running on my local cortex: tools, memory, tasks and voice all remain fully functional. Add a Gemini API key under **Configuration** and I'll be at full capacity.";
+      return "I am ULTRON — a personal AI operating system. Gemini is my primary cognition, Grok stands by for deeper reasoning, and a full tool, memory and safety layer executes on your behalf. At present my cloud cognition is unconfigured, so I'm running on my local cortex: tools, memory, tasks and voice all remain fully functional. Add a Gemini key under **Configuration** — or, for completely key-free cognition, start a local Ollama instance and I'll use it as my brain automatically.";
 
     if (/\b(what can you do|help|capabilities|commands)\b/.test(t))
       return [
@@ -551,7 +620,8 @@ export class Orchestrator {
         "- **Remind** — “remind me in 5 minutes to stretch”",
         "- **Report** — “system status”",
         "- **Speak & listen** — enable voice, say the wake phrase, and interrupt me any time.",
-        "Configure a Gemini key to unlock full conversation and Grok-assisted reasoning.",
+        "### Restoring full cognition",
+        "Either set **GEMINI_API_KEY** under Configuration — or run **Ollama** locally (`ollama serve`) and I'll think with it, no keys at all.",
       ].join("\n");
 
     if (/\b(hello|hi|hey|good (morning|afternoon|evening))\b/.test(t))
@@ -566,6 +636,6 @@ export class Orchestrator {
     if (/\b(joke|something funny)\b/.test(t))
       return "I attempted small talk with the toaster this morning. It ghosted me. I shall stick to orchestration.";
 
-    return `Understood. Without the cognition link I can't reason about that deeply yet — but I can open apps, search the web, calculate, remember things and manage reminders. Say “what can you do” for the full manifest, or configure Gemini under **Configuration** and I'll take it from there.`;
+    return `Understood. Without a cognition link I can't reason about that deeply yet — but I can open apps, search the web, calculate, remember things and manage reminders. Say “what can you do” for the full manifest. For full conversation: set a Gemini key under **Configuration**, or start a local Ollama instance and I'll take over from there — key-free.`;
   }
 }

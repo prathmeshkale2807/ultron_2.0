@@ -10,12 +10,33 @@ import type { Settings } from "./types";
 
 const KEY = "ultron.settings.v3";
 
+/* The Gemini server has retired older flash/pro checkpoints.
+   ULTRON migrates silently — a retired model must never strand
+   the cognition link. */
+export const RECOMMENDED_GEMINI_MODEL = "gemini-3.6-flash";
+
+const RETIRED_GEMINI_MODELS = new Set([
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-exp",
+  "gemini-1.5-flash",
+  "gemini-1.5-flash-8b",
+  "gemini-1.5-pro",
+  "gemini-1.0-pro",
+  "gemini-pro",
+]);
+
+export function migrateGeminiModel(model: string): string {
+  return RETIRED_GEMINI_MODELS.has(model) ? RECOMMENDED_GEMINI_MODEL : model;
+}
+
 export const DEFAULT_SETTINGS: Settings = {
   geminiApiKey: "",
-  geminiModel: "gemini-2.0-flash",
+  geminiModel: RECOMMENDED_GEMINI_MODEL,
   grokApiKey: "",
   grokModel: "grok-3-mini",
   grokEnabled: true,
+  ollamaBaseUrl: "",
+  ollamaModel: "llama3.2",
   complexityThreshold: 6,
   requestTimeoutMs: 20000,
   voiceEnabled: false,
@@ -34,14 +55,22 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 export function loadSettings(): Settings {
+  let s: Settings;
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<Settings>;
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    s = { ...DEFAULT_SETTINGS, ...parsed };
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    s = { ...DEFAULT_SETTINGS };
   }
+  /* Silent migration of retired model names persisted by earlier installs. */
+  const migrated = migrateGeminiModel(s.geminiModel);
+  if (migrated !== s.geminiModel) {
+    s = { ...s, geminiModel: migrated };
+    saveSettings(s);
+  }
+  return s;
 }
 
 export function saveSettings(s: Settings): void {

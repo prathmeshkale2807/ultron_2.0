@@ -504,7 +504,7 @@ function ConfigTab({ api }: { api: UltronApi }) {
 
   const set = (patch: Partial<Settings>) => setDraft((d) => ({ ...d, ...patch }));
 
-  const runTest = async (which: "gemini" | "grok" | "elevenlabs") => {
+  const runTest = async (which: "gemini" | "grok" | "ollama" | "elevenlabs") => {
     setTesting(which);
     setTestOut((o) => ({ ...o, [which]: "" }));
     const out = await api.testProvider(which);
@@ -520,9 +520,28 @@ function ConfigTab({ api }: { api: UltronApi }) {
           <Field label="GEMINI_API_KEY" hint={maskKey(draft.geminiApiKey)}>
             <input type="password" value={draft.geminiApiKey} onChange={(e) => set({ geminiApiKey: e.target.value })} placeholder="AIza…" className={inputCls} />
           </Field>
-          <Field label="GEMINI_MODEL">
-            <input value={draft.geminiModel} onChange={(e) => set({ geminiModel: e.target.value })} className={inputCls} />
+          <Field label="GEMINI_MODEL" hint="retired models auto-migrate on load">
+            <input value={draft.geminiModel} onChange={(e) => set({ geminiModel: e.target.value })} placeholder="gemini-3.6-flash" className={inputCls} />
           </Field>
+          <div className="-mt-1 flex items-center gap-1.5">
+            <span className="font-mono text-[8px] tracking-wider text-faint">QUICK:</span>
+            {["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"].map((m) => (
+              <button
+                key={m}
+                onClick={() => set({ geminiModel: m })}
+                className={`rounded border px-1.5 py-[3px] font-mono text-[8.5px] transition-all active:translate-y-px ${
+                  draft.geminiModel === m
+                    ? "border-core/60 bg-core/10 text-core"
+                    : "border-line2/60 bg-panel2 text-dim hover:border-core/40 hover:text-ice"
+                }`}
+              >
+                {m.replace("gemini-", "")}
+              </button>
+            ))}
+            <span className="ml-auto font-mono text-[8px] text-faint" title="The server may retire checkpoints without notice — ULTRON migrates and retries automatically.">
+              server-recommended: 3.6-flash
+            </span>
+          </div>
           <div className="flex items-center gap-2">
             <button onClick={() => runTest("gemini")} disabled={testing !== null} className="display rounded border border-glow/50 bg-glow/5 px-2.5 py-1.5 text-[8px] tracking-[0.18em] text-glow transition-all hover:bg-glow/15 disabled:opacity-40">
               {testing === "gemini" ? "TESTING…" : "TEST LINK"}
@@ -554,6 +573,28 @@ function ConfigTab({ api }: { api: UltronApi }) {
           <Field label="REQUEST TIMEOUT (MS)">
             <input type="number" min={5000} max={60000} step={1000} value={draft.requestTimeoutMs} onChange={(e) => set({ requestTimeoutMs: Number(e.target.value) || 20000 })} className={inputCls} />
           </Field>
+        </div>
+      </div>
+
+      <div>
+        <div className="panel-title mb-2 text-lime/80">Local Brain · Ollama</div>
+        <div className="space-y-2.5">
+          <div className="rounded border border-lime/25 bg-lime/5 px-2.5 py-2 font-mono text-[9px] leading-relaxed text-lime/80">
+            KEY-FREE COGNITION. Run <span className="text-lime">ollama serve</span> locally and ULTRON thinks with it
+            automatically — used as primary when no cloud keys exist, and as the last fallback otherwise.
+          </div>
+          <Field label="OLLAMA_BASE_URL" hint="local instance">
+            <input value={draft.ollamaBaseUrl} onChange={(e) => set({ ollamaBaseUrl: e.target.value })} placeholder="http://localhost:11434" className={inputCls} />
+          </Field>
+          <Field label="OLLAMA_MODEL">
+            <input value={draft.ollamaModel} onChange={(e) => set({ ollamaModel: e.target.value })} placeholder="llama3.2" className={inputCls} />
+          </Field>
+          <div className="flex items-center gap-2">
+            <button onClick={() => runTest("ollama")} disabled={testing !== null} className="display rounded border border-lime/50 bg-lime/5 px-2.5 py-1.5 text-[8px] tracking-[0.18em] text-lime transition-all hover:bg-lime/15 disabled:opacity-40">
+              {testing === "ollama" ? "TESTING…" : "TEST LINK"}
+            </button>
+            <span className="font-mono text-[8.5px] leading-snug text-dim">{testOut.ollama}</span>
+          </div>
         </div>
       </div>
 

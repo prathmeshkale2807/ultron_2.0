@@ -56,6 +56,7 @@ export default function App() {
             mic={api.mic}
             voiceSupported={api.voiceSupported}
             onToggleVoice={() => void api.toggleVoice()}
+            cognitionReady={api.cognitionReady}
             settings={api.settings}
             onOpenConfig={() => {
               setOpsTab("config");

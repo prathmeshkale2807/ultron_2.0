@@ -10,7 +10,15 @@ import { MemoryManager } from "../core/memory";
 import { TaskManager } from "../core/tasks";
 import { AuditLogger, ConfirmationBroker, SafetyGate } from "../core/safety";
 import { ToolRegistry } from "../core/tools";
-import { ProviderManager, generateGemini, generateGrok, synthesizeElevenLabs } from "../core/providers";
+import {
+  ProviderManager,
+  NotConfiguredError,
+  generateGemini,
+  generateGrok,
+  generateOllama,
+  pingOllama,
+  synthesizeElevenLabs,
+} from "../core/providers";
 import { Orchestrator } from "../core/orchestrator";
 import { VoiceController } from "../core/voice";
 import type {
@@ -39,6 +47,7 @@ function buildControllers(
   settingsRef: { current: Settings },
   sessionIdRef: { current: string },
   processRef: { current: (text: string) => Promise<AssistantTurn> },
+  patchRef: { current: (p: Partial<Settings>) => void },
   onState: (s: VoiceState) => void,
   onMic: (m: MicStatus) => void
 ): Controllers {
@@ -63,9 +72,10 @@ function buildControllers(
         `- ${label}: ${status}${note ? ` — ${note}` : ""}`;
       return [
         "### ULTRON Diagnostic Report",
-        line("Gemini (primary cognition)", h.gemini.status, h.gemini.latencyMs ? `${h.gemini.latencyMs} ms` : h.gemini.note),
-        line("Grok (reasoning engine)", h.grok.status, h.grok.latencyMs ? `${h.grok.latencyMs} ms` : h.grok.note),
-        line("ElevenLabs (premium voice)", h.elevenlabs.status, h.elevenlabs.note),
+        line("Gemini (primary cognition)", h.gemini.status === "unconfigured" ? "standby — no key" : h.gemini.status, h.gemini.latencyMs ? `${h.gemini.latencyMs} ms` : h.gemini.note),
+        line("Grok (reasoning engine)", h.grok.status === "unconfigured" ? "standby — no key" : h.grok.status, h.grok.latencyMs ? `${h.grok.latencyMs} ms` : h.grok.note),
+        line("Ollama (local brain)", h.ollama.status === "unconfigured" ? "standby — not configured" : h.ollama.status, h.ollama.latencyMs ? `${h.ollama.latencyMs} ms · ${h.ollama.note}` : h.ollama.note),
+        line("ElevenLabs (premium voice)", h.elevenlabs.status === "unconfigured" ? "standby — local TTS covering" : h.elevenlabs.status, h.elevenlabs.note),
         line("Memory core", "online", `${memory.count()} entries stored`),
         line("Tool registry", "online", "11 tools armed, safety gate enforced"),
         line("Task automation", "online", `${tasks.pendingCount()} pending`),
@@ -85,6 +95,7 @@ function buildControllers(
     registry,
     providers,
     sessionId: () => sessionIdRef.current,
+    onSettingsPatch: (p) => patchRef.current(p),
   });
 
   const voice = new VoiceController({
@@ -127,9 +138,10 @@ export function useUltron() {
   const [, setTick] = useState(0);
   const rerender = useCallback(() => setTick((t) => t + 1), []);
 
+  const patchRef = useRef<(p: Partial<Settings>) => void>(() => {});
   const cRef = useRef<Controllers | null>(null);
   if (!cRef.current) {
-    cRef.current = buildControllers(settingsRef, sessionIdRef, processRef, setVoiceState, setMic);
+    cRef.current = buildControllers(settingsRef, sessionIdRef, processRef, patchRef, setVoiceState, setMic);
   }
   const c = cRef.current;
 
@@ -196,7 +208,7 @@ export function useUltron() {
   useEffect(() => {
     const iv = setInterval(() => {
       const s = settingsRef.current;
-      if (s.geminiApiKey || s.grokApiKey || s.elevenApiKey) {
+      if (s.geminiApiKey || s.grokApiKey || s.elevenApiKey || s.ollamaBaseUrl.trim()) {
         void c.providers.refresh(s);
       }
     }, 60000);
@@ -323,6 +335,10 @@ export function useUltron() {
     },
     [c]
   );
+  /* Provider self-healing (retired-model migration) flows through here. */
+  useEffect(() => {
+    patchRef.current = updateSettings;
+  }, [updateSettings]);
 
   const newSession = useCallback(() => {
     c.orchestrator.reset();
@@ -341,16 +357,20 @@ export function useUltron() {
   }, [c, sendMessage]);
 
   const testProvider = useCallback(
-    async (which: "gemini" | "grok" | "elevenlabs"): Promise<string> => {
+    async (which: "gemini" | "grok" | "ollama" | "elevenlabs"): Promise<string> => {
       const s = settingsRef.current;
       const t0 = performance.now();
       try {
         if (which === "gemini") {
-          const out = await generateGemini(s, {
-            messages: [{ role: "user", content: "Reply with exactly: ULTRON LINK ESTABLISHED" }],
-            maxTokens: 40,
-            timeoutMs: 12000,
-          });
+          const out = await generateGemini(
+            s,
+            {
+              messages: [{ role: "user", content: "Reply with exactly: ULTRON LINK ESTABLISHED" }],
+              maxTokens: 40,
+              timeoutMs: 12000,
+            },
+            (model) => patchRef.current({ geminiModel: model })
+          );
           return `Link established in ${Math.round(performance.now() - t0)} ms — “${out.slice(0, 60)}”`;
         }
         if (which === "grok") {
@@ -361,6 +381,15 @@ export function useUltron() {
           });
           return `Reasoning engine verified in ${Math.round(performance.now() - t0)} ms — “${out.slice(0, 60)}”`;
         }
+        if (which === "ollama") {
+          const r = await pingOllama(s);
+          const probe = await generateOllama(s, {
+            messages: [{ role: "user", content: "Reply with exactly: LOCAL BRAIN READY" }],
+            maxTokens: 20,
+            timeoutMs: 30000,
+          });
+          return `Local brain verified in ${r.ms} ms — ${r.models} model${r.models === 1 ? "" : "s"} available · “${probe.slice(0, 40)}”`;
+        }
         const blob = await synthesizeElevenLabs("ULTRON voice link established.", s);
         const url = URL.createObjectURL(blob);
         const a = new Audio(url);
@@ -368,7 +397,22 @@ export function useUltron() {
         void a.play().catch(() => URL.revokeObjectURL(url));
         return `Voice synthesised in ${Math.round(performance.now() - t0)} ms — playing sample.`;
       } catch (e) {
-        return `Failed — ${e instanceof Error ? e.message : "unknown error"}`;
+        if (e instanceof NotConfiguredError) {
+          switch (which) {
+            case "gemini":
+              return "Standby — set GEMINI_API_KEY here, or run key-free on the local Ollama brain.";
+            case "grok":
+              return "Standby — optional by design. Set GROK_API_KEY to arm deeper reasoning.";
+            case "ollama":
+              return "Standby — set a base URL (default http://localhost:11434) and start “ollama serve”.";
+            default:
+              return "Standby — local browser speech covers output. Add ELEVENLABS_API_KEY for premium voices.";
+          }
+        }
+        const msg = e instanceof Error ? e.message : "unknown error";
+        if (which === "ollama")
+          return `Unreachable — ${msg}. Start Ollama (“ollama serve”) and pull a model (“ollama pull ${s.ollamaModel || "llama3.2"}”).`;
+        return `Link failed — ${msg}`;
       }
     },
     []
@@ -383,8 +427,17 @@ export function useUltron() {
     const provState = (status: string): SubsystemStatus["state"] =>
       status === "online" ? "online" : status === "degraded" ? "degraded" : status === "offline" ? "offline" : "standby";
     return [
-      { id: "gemini", label: "Gemini · Primary Cognition", state: provState(h.gemini.status), detail: provLine(h.gemini.status, h.gemini.latencyMs, h.gemini.note) },
+      {
+        id: "gemini",
+        label: "Gemini · Primary Cognition",
+        state: provState(h.gemini.status),
+        detail:
+          h.gemini.status === "online"
+            ? `${s.geminiModel} · ${h.gemini.latencyMs ?? "—"} ms`
+            : provLine(h.gemini.status, h.gemini.latencyMs, h.gemini.note),
+      },
       { id: "grok", label: "Grok · Reasoning Engine", state: provState(h.grok.status), detail: s.grokEnabled ? provLine(h.grok.status, h.grok.latencyMs, h.grok.note) : "disabled by policy" },
+      { id: "ollama", label: "Ollama · Local Brain", state: provState(h.ollama.status), detail: h.ollama.status === "unconfigured" ? "key-free option · not configured" : provLine(h.ollama.status, h.ollama.latencyMs, h.ollama.note) },
       { id: "eleven", label: "ElevenLabs · Voice Synth", state: provState(h.elevenlabs.status), detail: provLine(h.elevenlabs.status, h.elevenlabs.latencyMs, h.elevenlabs.note) },
       {
         id: "voice",
@@ -427,6 +480,7 @@ export function useUltron() {
     tasks: c.tasks,
     providers: c.providers,
     voiceSupported: c.voice.isSupported(),
+    cognitionReady: c.providers.cognitionAvailable(settingsRef.current),
   };
 }
 
