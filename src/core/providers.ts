@@ -9,7 +9,7 @@
    ============================================================ */
 
 import { emitEvent, logger } from "./eventBus";
-import { redact } from "./config";
+import { migrateGeminiModel, RECOMMENDED_GEMINI_MODEL, redact } from "./config";
 import type { ProviderHealth, ProviderId, Settings } from "./types";
 
 export interface GenerateOptions {
@@ -47,15 +47,30 @@ export class NotConfiguredError extends Error {
   }
 }
 
+/* Raised when the Gemini server retires the configured checkpoint.
+   The orchestrator migrates to the server-recommended model and
+   retries once — a model retirement must never read as a crash. */
+export class ModelRetiredError extends Error {
+  readonly kind = "model-retired";
+  constructor(
+    readonly requested: string,
+    readonly recommended?: string
+  ) {
+    super(
+      `Model ${requested} has been retired${recommended ? ` — server recommends ${recommended}` : ""}.`
+    );
+    this.name = "ModelRetiredError";
+  }
+}
+
 /* ------------------------- GEMINI ------------------------- */
 
-export async function generateGemini(
+async function callGeminiModel(
+  key: string,
+  model: string,
   s: Settings,
   opts: GenerateOptions
 ): Promise<string> {
-  const key = s.geminiApiKey.trim();
-  if (!key) throw new NotConfiguredError("Gemini", "GEMINI_API_KEY");
-  const model = s.geminiModel.trim() || "gemini-2.0-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent?key=${encodeURIComponent(key)}`;
@@ -92,6 +107,12 @@ export async function generateGemini(
     } catch {
       /* body was not json */
     }
+    /* Server-side model retirement: parse the directive, fail typed. */
+    if (res.status === 404 && /no longer available|deprecat/i.test(msg)) {
+      const candidates = Array.from(msg.matchAll(/models\/([A-Za-z0-9._-]+)/g)).map((m) => m[1]);
+      const recommended = candidates.find((c) => c !== model) ?? RECOMMENDED_GEMINI_MODEL;
+      throw new ModelRetiredError(model, recommended);
+    }
     throw new Error(`Gemini request failed — ${msg}`);
   }
 
@@ -108,6 +129,33 @@ export async function generateGemini(
     );
   }
   return text;
+}
+
+export async function generateGemini(
+  s: Settings,
+  opts: GenerateOptions,
+  onModelMigrate?: (model: string) => void
+): Promise<string> {
+  const key = s.geminiApiKey.trim();
+  if (!key) throw new NotConfiguredError("Gemini", "GEMINI_API_KEY");
+  const model = migrateGeminiModel(s.geminiModel.trim() || RECOMMENDED_GEMINI_MODEL);
+  try {
+    return await callGeminiModel(key, model, s, opts);
+  } catch (e) {
+    if (e instanceof ModelRetiredError) {
+      const target = e.recommended ?? RECOMMENDED_GEMINI_MODEL;
+      logger.info("gemini", `Server retired ${e.requested} — self-migrating cognition to ${target}`);
+      emitEvent(
+        "PROVIDER_HEALTH",
+        "providers",
+        `Gemini model migrated ${e.requested} → ${target} (server directive)`,
+        "warn"
+      );
+      onModelMigrate?.(target);
+      return callGeminiModel(key, target, s, opts);
+    }
+    throw e;
+  }
 }
 
 export async function pingGemini(s: Settings): Promise<number> {

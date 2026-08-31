@@ -47,6 +47,7 @@ function buildControllers(
   settingsRef: { current: Settings },
   sessionIdRef: { current: string },
   processRef: { current: (text: string) => Promise<AssistantTurn> },
+  patchRef: { current: (p: Partial<Settings>) => void },
   onState: (s: VoiceState) => void,
   onMic: (m: MicStatus) => void
 ): Controllers {
@@ -94,6 +95,7 @@ function buildControllers(
     registry,
     providers,
     sessionId: () => sessionIdRef.current,
+    onSettingsPatch: (p) => patchRef.current(p),
   });
 
   const voice = new VoiceController({
@@ -136,9 +138,10 @@ export function useUltron() {
   const [, setTick] = useState(0);
   const rerender = useCallback(() => setTick((t) => t + 1), []);
 
+  const patchRef = useRef<(p: Partial<Settings>) => void>(() => {});
   const cRef = useRef<Controllers | null>(null);
   if (!cRef.current) {
-    cRef.current = buildControllers(settingsRef, sessionIdRef, processRef, setVoiceState, setMic);
+    cRef.current = buildControllers(settingsRef, sessionIdRef, processRef, patchRef, setVoiceState, setMic);
   }
   const c = cRef.current;
 
@@ -332,6 +335,10 @@ export function useUltron() {
     },
     [c]
   );
+  /* Provider self-healing (retired-model migration) flows through here. */
+  useEffect(() => {
+    patchRef.current = updateSettings;
+  }, [updateSettings]);
 
   const newSession = useCallback(() => {
     c.orchestrator.reset();
@@ -355,11 +362,15 @@ export function useUltron() {
       const t0 = performance.now();
       try {
         if (which === "gemini") {
-          const out = await generateGemini(s, {
-            messages: [{ role: "user", content: "Reply with exactly: ULTRON LINK ESTABLISHED" }],
-            maxTokens: 40,
-            timeoutMs: 12000,
-          });
+          const out = await generateGemini(
+            s,
+            {
+              messages: [{ role: "user", content: "Reply with exactly: ULTRON LINK ESTABLISHED" }],
+              maxTokens: 40,
+              timeoutMs: 12000,
+            },
+            (model) => patchRef.current({ geminiModel: model })
+          );
           return `Link established in ${Math.round(performance.now() - t0)} ms — “${out.slice(0, 60)}”`;
         }
         if (which === "grok") {
@@ -416,7 +427,15 @@ export function useUltron() {
     const provState = (status: string): SubsystemStatus["state"] =>
       status === "online" ? "online" : status === "degraded" ? "degraded" : status === "offline" ? "offline" : "standby";
     return [
-      { id: "gemini", label: "Gemini · Primary Cognition", state: provState(h.gemini.status), detail: provLine(h.gemini.status, h.gemini.latencyMs, h.gemini.note) },
+      {
+        id: "gemini",
+        label: "Gemini · Primary Cognition",
+        state: provState(h.gemini.status),
+        detail:
+          h.gemini.status === "online"
+            ? `${s.geminiModel} · ${h.gemini.latencyMs ?? "—"} ms`
+            : provLine(h.gemini.status, h.gemini.latencyMs, h.gemini.note),
+      },
       { id: "grok", label: "Grok · Reasoning Engine", state: provState(h.grok.status), detail: s.grokEnabled ? provLine(h.grok.status, h.grok.latencyMs, h.grok.note) : "disabled by policy" },
       { id: "ollama", label: "Ollama · Local Brain", state: provState(h.ollama.status), detail: h.ollama.status === "unconfigured" ? "key-free option · not configured" : provLine(h.ollama.status, h.ollama.latencyMs, h.ollama.note) },
       { id: "eleven", label: "ElevenLabs · Voice Synth", state: provState(h.elevenlabs.status), detail: provLine(h.elevenlabs.status, h.elevenlabs.latencyMs, h.elevenlabs.note) },

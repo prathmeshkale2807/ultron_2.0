@@ -520,9 +520,28 @@ function ConfigTab({ api }: { api: UltronApi }) {
           <Field label="GEMINI_API_KEY" hint={maskKey(draft.geminiApiKey)}>
             <input type="password" value={draft.geminiApiKey} onChange={(e) => set({ geminiApiKey: e.target.value })} placeholder="AIza…" className={inputCls} />
           </Field>
-          <Field label="GEMINI_MODEL">
-            <input value={draft.geminiModel} onChange={(e) => set({ geminiModel: e.target.value })} className={inputCls} />
+          <Field label="GEMINI_MODEL" hint="retired models auto-migrate on load">
+            <input value={draft.geminiModel} onChange={(e) => set({ geminiModel: e.target.value })} placeholder="gemini-3.6-flash" className={inputCls} />
           </Field>
+          <div className="-mt-1 flex items-center gap-1.5">
+            <span className="font-mono text-[8px] tracking-wider text-faint">QUICK:</span>
+            {["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"].map((m) => (
+              <button
+                key={m}
+                onClick={() => set({ geminiModel: m })}
+                className={`rounded border px-1.5 py-[3px] font-mono text-[8.5px] transition-all active:translate-y-px ${
+                  draft.geminiModel === m
+                    ? "border-core/60 bg-core/10 text-core"
+                    : "border-line2/60 bg-panel2 text-dim hover:border-core/40 hover:text-ice"
+                }`}
+              >
+                {m.replace("gemini-", "")}
+              </button>
+            ))}
+            <span className="ml-auto font-mono text-[8px] text-faint" title="The server may retire checkpoints without notice — ULTRON migrates and retries automatically.">
+              server-recommended: 3.6-flash
+            </span>
+          </div>
           <div className="flex items-center gap-2">
             <button onClick={() => runTest("gemini")} disabled={testing !== null} className="display rounded border border-glow/50 bg-glow/5 px-2.5 py-1.5 text-[8px] tracking-[0.18em] text-glow transition-all hover:bg-glow/15 disabled:opacity-40">
               {testing === "gemini" ? "TESTING…" : "TEST LINK"}

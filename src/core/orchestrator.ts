@@ -26,6 +26,9 @@ export interface OrchestratorDeps {
   registry: ToolRegistry;
   providers: ProviderManager;
   sessionId: () => string;
+  /* Lets provider self-healing (e.g. retired-model migration)
+     persist its fix into the central configuration. */
+  onSettingsPatch?: (patch: Partial<Settings>) => void;
 }
 
 const PERSONA = `You are ULTRON, a sophisticated personal AI operating system serving one user.
@@ -472,7 +475,11 @@ export class Orchestrator {
     for (let attempt = 0; attempt < 2 && reply === null; attempt++) {
       try {
         if (this.deps.providers.geminiReady(s)) {
-          reply = await generateGemini(s, { system, messages, timeoutMs: s.requestTimeoutMs });
+          reply = await generateGemini(
+            s,
+            { system, messages, timeoutMs: s.requestTimeoutMs },
+            (model) => this.deps.onSettingsPatch?.({ geminiModel: model })
+          );
         } else {
           throw new Error("Gemini health is offline.");
         }
